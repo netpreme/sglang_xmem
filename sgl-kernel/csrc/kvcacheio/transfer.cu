@@ -341,6 +341,81 @@ void transfer_kv_launcher(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
+void transfer_kv_launcher_ptr(
+    const void* src_k,
+    void* dst_k,
+    const void* src_v,
+    void* dst_v,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t num_items,
+    int64_t start_layer_id,
+    int64_t num_layers_to_process,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    const uintptr_t* src_k_tbl_ptr,
+    const uintptr_t* dst_k_tbl_ptr,
+    const uintptr_t* src_v_tbl_ptr,
+    const uintptr_t* dst_v_tbl_ptr,
+    int64_t block_quota,
+    int64_t num_warps_per_block,
+    const int64_t page_size = 16,
+    const int64_t head_num = 1) {
+  TORCH_CHECK(item_size % 8 == 0, "Item byte size must be divisible by 8");
+
+  auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+  const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
+  const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
+  dim3 grid_dim(num_blocks, 1, 1);
+  const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
+
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  if constexpr (PageHeadLayout) {
+    transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        start_layer_id,
+        num_layers_to_process,
+        num_items,
+        items_per_warp,
+        item_size,
+        src_layout_dim,
+        dst_layout_dim,
+        src_k_tbl_ptr,
+        dst_k_tbl_ptr,
+        src_v_tbl_ptr,
+        dst_v_tbl_ptr,
+        page_size,
+        head_num);
+  } else {
+    transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        start_layer_id,
+        num_layers_to_process,
+        num_items,
+        items_per_warp,
+        item_size,
+        src_layout_dim,
+        dst_layout_dim,
+        src_k_tbl_ptr,
+        dst_k_tbl_ptr,
+        src_v_tbl_ptr,
+        dst_v_tbl_ptr);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void transfer_kv_per_layer(
     const at::Tensor src_k,
     at::Tensor dst_k,
@@ -666,6 +741,349 @@ void transfer_kv_all_layer_mla_lf_pf(
       empty,
       empty,
       empty,
+      block_quota,
+      num_warps_per_block);
+}
+
+// Helper to validate and extract raw pointers from index tensors.
+static void check_indices(const at::Tensor& src_indices, const at::Tensor& dst_indices) {
+  TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
+  TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+}
+
+void transfer_kv_per_layer_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf<const char>, get_global_offset_lf<char>, false>(
+      reinterpret_cast<const void*>(src_k),
+      reinterpret_cast<void*>(dst_k),
+      reinterpret_cast<const void*>(src_v),
+      reinterpret_cast<void*>(dst_v),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      1,
+      item_size,
+      0,
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_per_layer_pf_lf_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_pf<const char>, get_global_offset_lf<char>, false>(
+      reinterpret_cast<const void*>(src_k),
+      reinterpret_cast<void*>(dst_k),
+      reinterpret_cast<const void*>(src_v),
+      reinterpret_cast<void*>(dst_v),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_per_layer_ph_lf_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_ph<const char>, get_global_offset_per_head_lf<char>, false, true>(
+      reinterpret_cast<const void*>(src_k),
+      reinterpret_cast<void*>(dst_k),
+      reinterpret_cast<const void*>(src_v),
+      reinterpret_cast<void*>(dst_v),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
+void transfer_kv_all_layer_ptr(
+    int64_t src_k_layers,
+    int64_t dst_k_layers,
+    int64_t src_v_layers,
+    int64_t dst_v_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, false>(
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      num_layers,
+      item_size,
+      0,
+      0,
+      reinterpret_cast<const uintptr_t*>(src_k_layers),
+      reinterpret_cast<const uintptr_t*>(dst_k_layers),
+      reinterpret_cast<const uintptr_t*>(src_v_layers),
+      reinterpret_cast<const uintptr_t*>(dst_v_layers),
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_all_layer_lf_pf_ptr(
+    int64_t src_k_layers,
+    int64_t dst_k,
+    int64_t src_v_layers,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, false>(
+      nullptr,
+      reinterpret_cast<void*>(dst_k),
+      nullptr,
+      reinterpret_cast<void*>(dst_v),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      reinterpret_cast<const uintptr_t*>(src_k_layers),
+      nullptr,
+      reinterpret_cast<const uintptr_t*>(src_v_layers),
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_all_layer_lf_ph_ptr(
+    int64_t src_k_layers,
+    int64_t dst_k,
+    int64_t src_v_layers,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t page_size,
+    int64_t head_num,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_per_head_lf_tbl<const char>, get_global_offset_ph<char>, false, true>(
+      nullptr,
+      reinterpret_cast<void*>(dst_k),
+      nullptr,
+      reinterpret_cast<void*>(dst_v),
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      reinterpret_cast<const uintptr_t*>(src_k_layers),
+      nullptr,
+      reinterpret_cast<const uintptr_t*>(src_v_layers),
+      nullptr,
+      block_quota,
+      num_warps_per_block,
+      page_size,
+      head_num);
+}
+
+void transfer_kv_per_layer_mla_ptr(
+    int64_t src,
+    int64_t dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf<const char>, get_global_offset_lf<char>, true>(
+      reinterpret_cast<const void*>(src),
+      reinterpret_cast<void*>(dst),
+      nullptr,
+      nullptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      1,
+      item_size,
+      0,
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_per_layer_mla_pf_lf_ptr(
+    int64_t src,
+    int64_t dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_pf<const char>, get_global_offset_lf<char>, true>(
+      reinterpret_cast<const void*>(src),
+      reinterpret_cast<void*>(dst),
+      nullptr,
+      nullptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      0,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_all_layer_mla_ptr(
+    int64_t src_layers,
+    int64_t dst_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, true>(
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      num_layers,
+      item_size,
+      0,
+      0,
+      reinterpret_cast<const uintptr_t*>(src_layers),
+      reinterpret_cast<const uintptr_t*>(dst_layers),
+      nullptr,
+      nullptr,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_all_layer_mla_lf_pf_ptr(
+    int64_t src_layers,
+    int64_t dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  check_indices(src_indices, dst_indices);
+  transfer_kv_launcher_ptr<get_global_offset_lf_tbl<const char>, get_global_offset_pf<char>, true>(
+      nullptr,
+      reinterpret_cast<void*>(dst),
+      nullptr,
+      nullptr,
+      src_indices.data_ptr<int64_t>(),
+      dst_indices.data_ptr<int64_t>(),
+      src_indices.numel(),
+      0,
+      num_layers,
+      item_size,
+      0,
+      dst_layout_dim,
+      reinterpret_cast<const uintptr_t*>(src_layers),
+      nullptr,
+      nullptr,
+      nullptr,
       block_quota,
       num_warps_per_block);
 }
