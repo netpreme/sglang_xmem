@@ -132,6 +132,12 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Use Torch Profiler. The endpoint must be launched with "
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
     return parser.parse_args()
 
 
@@ -514,10 +520,21 @@ class WorkloadGenerator:
 
         return performance_data
 
+def stop_profiler(base_url):
+    print("Stopping profiler...")
+    try:
+        response = requests.post(f"{base_url}/stop_profile")
+        if response.status_code == 200:
+            print("Profiler stopped")
+        else:
+            print(f"Failed to stop profiler. Status code: {response.status_code}")
+    except requests.RequestException as e:
+        print(f"Error communicating with profiler: {e}")
 
 if __name__ == "__main__":
     args = parse_args()
-    flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
+    base_url = f"http://{args.host}:{args.port}"
+    flush_cache_url = f"{base_url}/flush_cache"
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -533,5 +550,21 @@ if __name__ == "__main__":
         args.request_rate = rate
         requests.post(flush_cache_url)
         time.sleep(1)
+
+        timer = None 
+        if args.profile:
+            print("Starting profiler...")
+            response = requests.post(f"{base_url}/start_profile")
+            if response.status_code == 200:
+                print("Profiler started")
+                # Schedule stop_profiler to run after 10.0 seconds
+                timer = threading.Timer(10.0, stop_profiler, args=[base_url])
+                timer.start()
+
         performance_data = WorkloadGenerator(args).run()
+
+        if args.profile and timer and timer.is_alive():
+            timer.cancel()
+            stop_profiler(base_url)
+            
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
