@@ -43,9 +43,22 @@ if not (_is_npu or _is_xpu):
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
+        # direct doesn't support _ptr yet
+        transfer_kv_all_layer_ptr,
+        transfer_kv_all_layer_lf_pf_ptr,
+        transfer_kv_all_layer_lf_ph_ptr,
+        transfer_kv_all_layer_mla_ptr,
+        transfer_kv_all_layer_mla_lf_pf_ptr,
+        transfer_kv_per_layer_ptr,
+        transfer_kv_per_layer_mla_ptr,
+        transfer_kv_per_layer_mla_pf_lf_ptr,
+        transfer_kv_per_layer_pf_lf_ptr,
+        transfer_kv_per_layer_ph_lf_ptr,
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+
+import xmem
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +298,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+         
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -296,22 +310,24 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
-        )
+        # self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+        #     element_size=self.element_dim * self.dtype.itemsize
+        # )
+        self.can_use_jit = False
 
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
+            [x.remote_addr for x in self.k_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
         self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
+            [x.remote_addr for x in self.v_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        logger.info(f"Initialized MHATokenToKVPoolHost with {self.size} slots, using MTier")
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -325,12 +341,11 @@ class MHATokenToKVPoolHost(HostKVCache):
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
-            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+            dims = (self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
-            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+            dims = (self.size, self.layer_num, self.head_num, self.head_dim)
         elif self.layout == "page_first_direct":
             dims = (
-                2,
                 self.page_num,
                 self.layer_num,
                 self.page_size,
@@ -339,7 +354,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         elif self.layout == "page_head":
             dims = (
-                2,
                 self.page_num,
                 self.head_num,
                 self.page_size,
@@ -351,15 +365,17 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        buffer = alloc_func(
-            dims,
-            dtype=self.dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-            allocator=self.allocator,
-        )
-        return buffer
+        # alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        # buffer = alloc_func(
+        #     dims,
+        #     dtype=self.dtype,
+        #     device=self.device,
+        #     pin_memory=self.pin_memory,
+        #     allocator=self.allocator,
+        # )
+        k_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
+        v_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
+        return [k_buffer, v_buffer]
 
     @property
     def k_buffer(self):
@@ -390,26 +406,28 @@ class MHATokenToKVPoolHost(HostKVCache):
                         element_dim=self.element_dim,
                     )
                 else:
-                    transfer_kv_per_layer(
-                        src_k=self.k_buffer[layer_id],
+                    transfer_kv_per_layer_ptr(
+                        src_k=self.k_buffer[layer_id].remote_addr,
                         dst_k=device_pool.k_buffer[layer_id],
-                        src_v=self.v_buffer[layer_id],
+                        src_v=self.v_buffer[layer_id].remote_addr,
                         dst_v=device_pool.v_buffer[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_pf_lf(
-                    src_k=self.k_buffer,
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer,
-                    dst_v=device_pool.v_buffer[layer_id],
+                print(f"Calling transfer_kv_per_layer_pf_lf_ptr with layer_id={layer_id}, num_pages={host_indices.numel(), device_indices.numel()}, host_indices={host_indices}, device_indices={device_indices}")
+                transfer_kv_per_layer_pf_lf_ptr(
+                    src_k=self.k_buffer.remote_addr,
+                    dst_k=device_pool.k_buffer[layer_id].data_ptr(),
+                    src_v=self.v_buffer.remote_addr,
+                    dst_v=device_pool.v_buffer[layer_id].data_ptr(),
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
+                    block_quota=8,
                 )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
@@ -501,11 +519,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_lf_pf(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k=self.k_buffer,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v=self.v_buffer,
+                transfer_kv_all_layer_lf_pf_ptr(
+                    src_k_layers=device_pool.k_data_ptrs.data_ptr(),
+                    dst_k=self.k_buffer.remote_addr,
+                    src_v_layers=device_pool.v_data_ptrs.data_ptr(),
+                    dst_v=self.v_buffer.remote_addr,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     item_size=self.token_stride_size,
