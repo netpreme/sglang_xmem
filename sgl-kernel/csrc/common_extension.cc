@@ -444,6 +444,24 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_all_layer_mla_lf_pf_ptr(int src_layers, int dst, Tensor src_indices, Tensor dst_indices, "
       "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf_ptr", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf_ptr);
+  // Coalesced D2D memcpy ops for X-Mem (kCPU: index tensors are on CPU)
+  m.def(
+      "swap_kv_all_layer_ptr(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers) -> ()");
+  m.impl("swap_kv_all_layer_ptr", torch::kCPU, &swap_kv_all_layer_ptr);
+  m.def(
+      "swap_kv_per_layer_ptr(int src_k, int dst_k, int src_v, int dst_v, Tensor src_indices, Tensor dst_indices, "
+      "int item_size) -> ()");
+  m.impl("swap_kv_per_layer_ptr", torch::kCPU, &swap_kv_per_layer_ptr);
+  m.def(
+      "swap_kv_per_layer_pf_lf_ptr(int src_k, int dst_k, int src_v, int dst_v, Tensor src_indices, Tensor "
+      "dst_indices, int layer_id, int item_size, int src_layout_dim) -> ()");
+  m.impl("swap_kv_per_layer_pf_lf_ptr", torch::kCPU, &swap_kv_per_layer_pf_lf_ptr);
+  m.def(
+      "swap_kv_all_layer_lf_pf_ptr(int src_k_layers, int dst_k, int src_v_layers, int dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
+  m.impl("swap_kv_all_layer_lf_pf_ptr", torch::kCPU, &swap_kv_all_layer_lf_pf_ptr);
+
   m.def(
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");

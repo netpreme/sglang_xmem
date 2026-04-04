@@ -796,6 +796,48 @@ void transfer_kv_all_layer_mla_lf_pf_ptr(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+// Coalesced D2D memcpy transfer ops for X-Mem
+void swap_kv_all_layer_ptr(
+    const at::Tensor& src_k_layers,
+    const at::Tensor& dst_k_layers,
+    const at::Tensor& src_v_layers,
+    const at::Tensor& dst_v_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers);
+
+void swap_kv_per_layer_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size);
+
+void swap_kv_per_layer_pf_lf_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim);
+
+void swap_kv_all_layer_lf_pf_ptr(
+    int64_t src_k_layers,
+    int64_t dst_k,
+    int64_t src_v_layers,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers);
+
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,

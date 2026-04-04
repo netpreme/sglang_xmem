@@ -1205,6 +1205,221 @@ inline void transfer_kv_page_first_direct_impl(
   }
 }
 
+// Coalesced D2D memcpy for X-Mem. Merges consecutive index runs into larger
+// copies, then submits via cudaMemcpyBatchAsync. Falls back to D2D loop.
+// Requires: CPU indices, cudaMemcpyDeviceToDevice (X-Mem is type=0 to CUDA).
+
+#include <cuda_runtime.h>
+
+static void coalesced_memcpy_d2d(
+    const char* src, char* dst,
+    const int64_t* src_indices,
+    const int64_t* dst_indices,
+    int64_t num_items,
+    int64_t item_size_bytes,
+    cudaStream_t stream) {
+  if (num_items == 0) return;
+
+  std::vector<void*> srcs;
+  std::vector<void*> dsts;
+  std::vector<size_t> sizes;
+  srcs.reserve(num_items / 16);
+  dsts.reserve(num_items / 16);
+  sizes.reserve(num_items / 16);
+
+  int64_t run_src = src_indices[0];
+  int64_t run_dst = dst_indices[0];
+  int64_t run_len = 1;
+
+  auto flush_run = [&]() {
+    srcs.push_back(const_cast<char*>(src) + run_src * item_size_bytes);
+    dsts.push_back(dst + run_dst * item_size_bytes);
+    sizes.push_back(static_cast<size_t>(run_len) * item_size_bytes);
+  };
+
+  for (int64_t i = 1; i < num_items; ++i) {
+    int64_t s = src_indices[i];
+    int64_t d = dst_indices[i];
+    if (s == run_src + run_len && d == run_dst + run_len) {
+      run_len++;
+    } else {
+      flush_run();
+      run_src = s;
+      run_dst = d;
+      run_len = 1;
+    }
+  }
+  flush_run();
+
+  size_t count = srcs.size();
+
+  cudaMemcpyAttributes attr = {};
+  attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  std::vector<size_t> attrs_idxs(count, 0);
+  size_t fail_idx = 0;
+
+  cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(), srcs.data(), sizes.data(), count,
+      &attr, attrs_idxs.data(), 1,
+      &fail_idx, stream);
+
+  if (err != cudaSuccess) {
+    for (size_t i = 0; i < count; ++i) {
+      cudaMemcpyAsync(dsts[i], srcs[i], sizes[i],
+                      cudaMemcpyDeviceToDevice, stream);
+    }
+  }
+}
+
+// Per-layer coalesced D2D memcpy for X-Mem (layer_first layout).
+void swap_kv_per_layer_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size) {
+  TORCH_CHECK(src_indices.is_cpu(), "src_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(dst_indices.is_cpu(), "dst_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(),
+              "Source and destination indices must have the same length");
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t n = src_indices.numel();
+  const int64_t* src_idx = src_indices.data_ptr<int64_t>();
+  const int64_t* dst_idx = dst_indices.data_ptr<int64_t>();
+
+  coalesced_memcpy_d2d(
+      reinterpret_cast<const char*>(src_k),
+      reinterpret_cast<char*>(dst_k),
+      src_idx, dst_idx, n, item_size, stream);
+  coalesced_memcpy_d2d(
+      reinterpret_cast<const char*>(src_v),
+      reinterpret_cast<char*>(dst_v),
+      src_idx, dst_idx, n, item_size, stream);
+}
+
+// All-layer coalesced D2D memcpy for X-Mem (layer_first layout).
+// Transfers all layers in one call to avoid per-layer function dispatch overhead.
+// src/dst_k_layers_ptr: CPU tensor of per-layer base addresses (int64/uint64).
+void swap_kv_all_layer_ptr(
+    const at::Tensor& src_k_layers,
+    const at::Tensor& dst_k_layers,
+    const at::Tensor& src_v_layers,
+    const at::Tensor& dst_v_layers,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t num_layers) {
+  TORCH_CHECK(src_indices.is_cpu(), "src_indices must be a CPU tensor");
+  TORCH_CHECK(dst_indices.is_cpu(), "dst_indices must be a CPU tensor");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong);
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong);
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel());
+  TORCH_CHECK(src_k_layers.is_cpu() && src_k_layers.scalar_type() == at::kLong);
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t n = src_indices.numel();
+  const int64_t* src_idx = src_indices.data_ptr<int64_t>();
+  const int64_t* dst_idx = dst_indices.data_ptr<int64_t>();
+  const int64_t* src_k_ptrs = src_k_layers.data_ptr<int64_t>();
+  const int64_t* dst_k_ptrs = dst_k_layers.data_ptr<int64_t>();
+  const int64_t* src_v_ptrs = src_v_layers.data_ptr<int64_t>();
+  const int64_t* dst_v_ptrs = dst_v_layers.data_ptr<int64_t>();
+
+  for (int64_t layer = 0; layer < num_layers; ++layer) {
+    coalesced_memcpy_d2d(
+        reinterpret_cast<const char*>(src_k_ptrs[layer]),
+        reinterpret_cast<char*>(dst_k_ptrs[layer]),
+        src_idx, dst_idx, n, item_size, stream);
+    coalesced_memcpy_d2d(
+        reinterpret_cast<const char*>(src_v_ptrs[layer]),
+        reinterpret_cast<char*>(dst_v_ptrs[layer]),
+        src_idx, dst_idx, n, item_size, stream);
+  }
+}
+
+// Per-layer D2D memcpy: page_first src -> layer_first dst (no coalescing).
+void swap_kv_per_layer_pf_lf_ptr(
+    int64_t src_k,
+    int64_t dst_k,
+    int64_t src_v,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim) {
+  TORCH_CHECK(src_indices.is_cpu(), "src_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(dst_indices.is_cpu(), "dst_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(),
+              "Source and destination indices must have the same length");
+
+  const char* src_k_base = reinterpret_cast<const char*>(src_k);
+  char* dst_k_base = reinterpret_cast<char*>(dst_k);
+  const char* src_v_base = reinterpret_cast<const char*>(src_v);
+  char* dst_v_base = reinterpret_cast<char*>(dst_v);
+  const int64_t n = src_indices.numel();
+  const int64_t* src_idx = src_indices.data_ptr<int64_t>();
+  const int64_t* dst_idx = dst_indices.data_ptr<int64_t>();
+  int64_t layer_offset = layer_id * item_size;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  for (int64_t i = 0; i < n; ++i) {
+    int64_t src_off = src_idx[i] * src_layout_dim + layer_offset;
+    int64_t dst_off = dst_idx[i] * item_size;
+    cudaMemcpyAsync(dst_k_base + dst_off, src_k_base + src_off,
+                    item_size, cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(dst_v_base + dst_off, src_v_base + src_off,
+                    item_size, cudaMemcpyDeviceToDevice, stream);
+  }
+}
+
+// All-layer coalesced D2D memcpy for X-Mem (layer_first layout).
+void swap_kv_all_layer_lf_pf_ptr(
+    int64_t src_k_layers_ptr,
+    int64_t dst_k,
+    int64_t src_v_layers_ptr,
+    int64_t dst_v,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t dst_layout_dim,
+    int64_t num_layers) {
+  TORCH_CHECK(src_indices.is_cpu(), "src_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(dst_indices.is_cpu(), "dst_indices must be a CPU tensor for memcpy path");
+  TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
+  TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "Destination indices must be of type long");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(),
+              "Source and destination indices must have the same length");
+
+  const int64_t num_items = src_indices.numel();
+  const int64_t* src_idx = src_indices.data_ptr<int64_t>();
+  const int64_t* dst_idx = dst_indices.data_ptr<int64_t>();
+  const uintptr_t* k_layer_ptrs = reinterpret_cast<const uintptr_t*>(src_k_layers_ptr);
+  const uintptr_t* v_layer_ptrs = reinterpret_cast<const uintptr_t*>(src_v_layers_ptr);
+  char* dst_k_base = reinterpret_cast<char*>(dst_k);
+  char* dst_v_base = reinterpret_cast<char*>(dst_v);
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  for (int64_t layer = 0; layer < num_layers; ++layer) {
+    const char* src_k_layer = reinterpret_cast<const char*>(k_layer_ptrs[layer]);
+    const char* src_v_layer = reinterpret_cast<const char*>(v_layer_ptrs[layer]);
+    coalesced_memcpy_d2d(
+        src_k_layer, dst_k_base,
+        src_idx, dst_idx, num_items, item_size, stream);
+    coalesced_memcpy_d2d(
+        src_v_layer, dst_v_base,
+        src_idx, dst_idx, num_items, item_size, stream);
+  }
+}
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,

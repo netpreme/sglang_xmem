@@ -692,7 +692,15 @@ class HiCacheController:
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
         # move indices to GPU if using kernels, to host if using direct indexing
+        # X-Mem memcpy path needs CPU indices (cudaMemcpyAsync reads them on host)
         if self.io_backend == "kernel":
+            if getattr(self.mem_pool_host, 'use_xmem', False):
+                # Keep indices on CPU for coalesced cudaMemcpyAsync path
+                if host_indices.is_cuda:
+                    host_indices = host_indices.cpu()
+                if device_indices.is_cuda:
+                    device_indices = device_indices.cpu()
+                return host_indices, device_indices
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
@@ -721,15 +729,25 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
+            if getattr(self.mem_pool_host, 'use_xmem', False) and self.mem_pool_host.layout == "layer_first":
+                # All-layer bulk transfer for X-Mem: one C++ call, no per-layer overhead
+                self.mem_pool_host.load_to_device_all_layer(
                     self.mem_pool_device,
                     host_indices,
                     device_indices,
-                    i,
-                    self.io_backend,
                 )
-                producer_event.complete(i)
+                for i in range(self.layer_num):
+                    producer_event.complete(i)
+            else:
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                    producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.

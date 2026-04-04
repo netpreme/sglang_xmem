@@ -74,6 +74,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                use_xmem=server_args.hicache_use_xmem,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
