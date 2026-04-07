@@ -532,7 +532,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     disable_hicache_numa_detect: bool = False
-    hicache_use_xmem: bool = True
+    hicache_use_xmem: bool = False
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None

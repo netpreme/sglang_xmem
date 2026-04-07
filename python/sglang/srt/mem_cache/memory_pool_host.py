@@ -306,7 +306,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        use_xmem: bool = True,
+        use_xmem: bool = False,
     ):
         self.use_xmem = use_xmem
         if self.use_xmem and not _has_xmem:
