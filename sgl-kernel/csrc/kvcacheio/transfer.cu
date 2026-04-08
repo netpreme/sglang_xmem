@@ -1256,12 +1256,19 @@ static void coalesced_memcpy_d2d(
   cudaMemcpyAttributes attr = {};
   attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
   std::vector<size_t> attrs_idxs(count, 0);
+  // CUDA 13.0+ removed the failIdx parameter from cudaMemcpyBatchAsync.
+#if CUDART_VERSION >= 13000
+  cudaError_t err = cudaMemcpyBatchAsync(
+      dsts.data(), srcs.data(), sizes.data(), count,
+      &attr, attrs_idxs.data(), 1,
+      stream);
+#else
   size_t fail_idx = 0;
-
   cudaError_t err = cudaMemcpyBatchAsync(
       dsts.data(), srcs.data(), sizes.data(), count,
       &attr, attrs_idxs.data(), 1,
       &fail_idx, stream);
+#endif
 
   if (err != cudaSuccess) {
     for (size_t i = 0; i < count; ++i) {
