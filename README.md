@@ -92,7 +92,7 @@ We evaluated the integration of X-Mem into SGLang's hierarchical KV cache, compa
 
 X-Mem shows significant gains over CPU DRAM for high cache-hit rate workloads, where data copying dominates computation:
 
-* 🚀 Time to First Token (TTFT): ~3× faster than CPU DRAM at 80K tokens.
+* 🚀 Time to First Token (TTFT): ~4.6× faster than CPU DRAM at 80K tokens.
 <img src="assets/ttft_plot.png" width="70%" alt="TTFT Benchmark Plot" />
 
 ### Running the benchmark
