@@ -440,6 +440,99 @@ def transfer_kv_all_layer_mla_lf_pf_ptr(
     )
 
 
+# Coalesced D2D memcpy ops for X-Mem (CPU indices).
+
+
+def swap_kv_all_layer_ptr(
+    src_k_layers: torch.Tensor,
+    dst_k_layers: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+):
+    torch.ops.sgl_kernel.swap_kv_all_layer_ptr.default(
+        src_k_layers,
+        dst_k_layers,
+        src_v_layers,
+        dst_v_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+    )
+
+
+def swap_kv_per_layer_ptr(
+    src_k: int,
+    dst_k: int,
+    src_v: int,
+    dst_v: int,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+):
+    torch.ops.sgl_kernel.swap_kv_per_layer_ptr.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+    )
+
+
+def swap_kv_per_layer_pf_lf_ptr(
+    src_k: int,
+    dst_k: int,
+    src_v: int,
+    dst_v: int,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+):
+    torch.ops.sgl_kernel.swap_kv_per_layer_pf_lf_ptr.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+    )
+
+
+def swap_kv_all_layer_lf_pf_ptr(
+    src_k_layers: int,
+    dst_k: int,
+    src_v_layers: int,
+    dst_v: int,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+):
+    torch.ops.sgl_kernel.swap_kv_all_layer_lf_pf_ptr.default(
+        src_k_layers,
+        dst_k,
+        src_v_layers,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+    )
+
+
 def transfer_kv_direct(
     src_layers: List[torch.Tensor],
     dst_layers: List[torch.Tensor],

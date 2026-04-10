@@ -52,7 +52,9 @@ def _load_architecture_specific_ops():
         f"[sgl_kernel] GPU Detection: compute_capability = {compute_capability}"
     )
 
-    # Get the directory where sgl_kernel is installed
+    # Get the directory where sgl_kernel is installed.
+    # In editable installs, __file__ points to the source tree which may not
+    # contain built .so files. Fall back to site-packages in that case.
     sgl_kernel_dir = Path(__file__).parent
     logger.debug(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
 
@@ -72,6 +74,20 @@ def _load_architecture_specific_ops():
     ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
     raw_matching_files = glob.glob(ops_pattern)
     matching_files = _filter_compiled_extensions(raw_matching_files)
+
+    # Editable install fallback: check site-packages if source tree has no .so
+    if not matching_files:
+        import site
+        for sp in site.getsitepackages() + [site.getusersitepackages()]:
+            candidate = Path(sp) / "sgl_kernel"
+            if candidate.is_dir() and candidate != sgl_kernel_dir:
+                alt_ops_pattern = str(candidate / ops_subdir / "common_ops.*")
+                raw_matching_files = glob.glob(alt_ops_pattern)
+                matching_files = _filter_compiled_extensions(raw_matching_files)
+                if matching_files:
+                    logger.debug(f"[sgl_kernel] Found .so in site-packages: {candidate}")
+                    sgl_kernel_dir = candidate
+                    break
 
     logger.debug(f"[sgl_kernel] Attempting to load {variant_name}")
     logger.debug(f"[sgl_kernel] Looking for library matching pattern: {ops_pattern}")

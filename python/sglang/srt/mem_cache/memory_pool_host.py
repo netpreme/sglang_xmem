@@ -54,11 +54,20 @@ if not (_is_npu or _is_xpu):
         transfer_kv_per_layer_mla_pf_lf_ptr,
         transfer_kv_per_layer_pf_lf_ptr,
         transfer_kv_per_layer_ph_lf_ptr,
+        # Coalesced D2D memcpy ops for X-Mem
+        swap_kv_all_layer_ptr,
+        swap_kv_per_layer_ptr,
+        swap_kv_per_layer_pf_lf_ptr,
+        swap_kv_all_layer_lf_pf_ptr,
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
-import xmem
+try:
+    import xmem
+    _has_xmem = True
+except ImportError:
+    _has_xmem = False
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +306,14 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        use_xmem: bool = False,
     ):
-         
+        self.use_xmem = use_xmem
+        if self.use_xmem and not _has_xmem:
+            raise ImportError(
+                "X-Mem (xmem) is required when hicache_use_xmem=True but is not installed. "
+                "Use --no-hicache-use-xmem to fall back to CPU DRAM."
+            )
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -310,24 +325,48 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        # self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-        #     element_size=self.element_dim * self.dtype.itemsize
-        # )
-        self.can_use_jit = False
+        if self.use_xmem:
+            self.can_use_jit = False
+        else:
+            self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+                element_size=self.element_dim * self.dtype.itemsize
+            )
 
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        k_ptr_list = [x.remote_addr for x in self.k_data_refs] if self.use_xmem else [x.data_ptr() for x in self.k_data_refs]
+        v_ptr_list = [x.remote_addr for x in self.v_data_refs] if self.use_xmem else [x.data_ptr() for x in self.v_data_refs]
         self.k_data_ptrs = torch.tensor(
-            [x.remote_addr for x in self.k_data_refs],
+            k_ptr_list,
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
         self.v_data_ptrs = torch.tensor(
-            [x.remote_addr for x in self.v_data_refs],
+            v_ptr_list,
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        logger.info(f"Initialized MHATokenToKVPoolHost with {self.size} slots, using MTier")
+        # For X-Mem memcpy path: store CPU-side copies of device pool layer pointers
+        # (needed because cudaMemcpyAsync reads them from the host CPU loop)
+        if self.use_xmem:
+            # CPU-side pointer arrays for all-layer bulk transfer
+            self.device_k_data_ptrs_cpu = torch.tensor(
+                [device_pool.k_buffer[i].data_ptr() for i in range(self.layer_num)],
+                dtype=torch.int64,
+            )
+            self.device_v_data_ptrs_cpu = torch.tensor(
+                [device_pool.v_buffer[i].data_ptr() for i in range(self.layer_num)],
+                dtype=torch.int64,
+            )
+            self.k_data_ptrs_cpu = torch.tensor(
+                k_ptr_list, dtype=torch.int64,
+            )
+            self.v_data_ptrs_cpu = torch.tensor(
+                v_ptr_list, dtype=torch.int64,
+            )
+
+        backend_name = "MTier (X-Mem)" if self.use_xmem else "CPU DRAM"
+        logger.info(f"Initialized MHATokenToKVPoolHost with {self.size} slots, using {backend_name}")
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -340,42 +379,45 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
-        if self.layout == "layer_first":
-            dims = (self.layer_num, self.size, self.head_num, self.head_dim)
-        elif self.layout == "page_first":
-            dims = (self.size, self.layer_num, self.head_num, self.head_dim)
-        elif self.layout == "page_first_direct":
-            dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
-        elif self.layout == "page_head":
-            dims = (
-                self.page_num,
-                self.head_num,
-                self.page_size,
-                self.layer_num,
-                self.head_dim,
-            )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        # alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        # buffer = alloc_func(
-        #     dims,
-        #     dtype=self.dtype,
-        #     device=self.device,
-        #     pin_memory=self.pin_memory,
-        #     allocator=self.allocator,
-        # )
-        k_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
-        v_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
-        return [k_buffer, v_buffer]
+        if self.use_xmem:
+            # xmem allocates k and v separately (no leading dim=2)
+            if self.layout == "layer_first":
+                dims = (self.layer_num, self.size, self.head_num, self.head_dim)
+            elif self.layout == "page_first":
+                dims = (self.size, self.layer_num, self.head_num, self.head_dim)
+            elif self.layout == "page_first_direct":
+                dims = (self.page_num, self.layer_num, self.page_size, self.head_num, self.head_dim)
+            elif self.layout == "page_head":
+                dims = (self.page_num, self.head_num, self.page_size, self.layer_num, self.head_dim)
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            k_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
+            v_buffer = xmem.allocate(dims, dtype=self.dtype, bank_id=0, device=self.device)
+            return [k_buffer, v_buffer]
+        else:
+            # CPU DRAM: single buffer with leading dim=2 for k/v
+            if self.layout == "layer_first":
+                dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+            elif self.layout == "page_first":
+                dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+            elif self.layout == "page_first_direct":
+                dims = (2, self.page_num, self.layer_num, self.page_size, self.head_num, self.head_dim)
+            elif self.layout == "page_head":
+                dims = (2, self.page_num, self.head_num, self.page_size, self.layer_num, self.head_dim)
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            buffer = alloc_func(
+                dims,
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            return buffer
 
     @property
     def k_buffer(self):
@@ -384,6 +426,21 @@ class MHATokenToKVPoolHost(HostKVCache):
     @property
     def v_buffer(self):
         return self.kv_buffer[1]
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices,
+    ):
+        """All-layer transfer for X-Mem: loads all layers in one C++ call."""
+        swap_kv_all_layer_ptr(
+            src_k_layers=self.k_data_ptrs_cpu,
+            dst_k_layers=self.device_k_data_ptrs_cpu,
+            src_v_layers=self.v_data_ptrs_cpu,
+            dst_v_layers=self.device_v_data_ptrs_cpu,
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.token_stride_size,
+            num_layers=self.layer_num,
+        )
 
     def load_to_device_per_layer(
         self,
@@ -405,30 +462,51 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_src=host_indices,
                         element_dim=self.element_dim,
                     )
-                else:
-                    transfer_kv_per_layer_ptr(
+                elif self.use_xmem:
+                    swap_kv_per_layer_ptr(
                         src_k=self.k_buffer[layer_id].remote_addr,
-                        dst_k=device_pool.k_buffer[layer_id],
+                        dst_k=device_pool.k_buffer[layer_id].data_ptr(),
                         src_v=self.v_buffer[layer_id].remote_addr,
+                        dst_v=device_pool.v_buffer[layer_id].data_ptr(),
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=self.k_buffer[layer_id],
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer[layer_id],
                         dst_v=device_pool.v_buffer[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                print(f"Calling transfer_kv_per_layer_pf_lf_ptr with layer_id={layer_id}, num_pages={host_indices.numel(), device_indices.numel()}, host_indices={host_indices}, device_indices={device_indices}")
-                transfer_kv_per_layer_pf_lf_ptr(
-                    src_k=self.k_buffer.remote_addr,
-                    dst_k=device_pool.k_buffer[layer_id].data_ptr(),
-                    src_v=self.v_buffer.remote_addr,
-                    dst_v=device_pool.v_buffer[layer_id].data_ptr(),
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                    block_quota=8,
-                )
+                if self.use_xmem:
+                    swap_kv_per_layer_pf_lf_ptr(
+                        src_k=self.k_buffer.remote_addr,
+                        dst_k=device_pool.k_buffer[layer_id].data_ptr(),
+                        src_v=self.v_buffer.remote_addr,
+                        dst_v=device_pool.v_buffer[layer_id].data_ptr(),
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_pf_lf(
+                        src_k=self.k_buffer,
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer,
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -507,6 +585,17 @@ class MHATokenToKVPoolHost(HostKVCache):
                         kv_cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.element_dim * self.dtype.itemsize,
                     )
+                elif self.use_xmem:
+                    for layer_id in range(self.layer_num):
+                        swap_kv_per_layer_ptr(
+                            src_k=self.device_k_data_ptrs_cpu[layer_id].item(),
+                            dst_k=self.k_data_refs[layer_id].remote_addr,
+                            src_v=self.device_v_data_ptrs_cpu[layer_id].item(),
+                            dst_v=self.v_data_refs[layer_id].remote_addr,
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                        )
                 else:
                     transfer_kv_all_layer(
                         src_k_layers=device_pool.k_data_ptrs,
@@ -519,17 +608,30 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_lf_pf_ptr(
-                    src_k_layers=device_pool.k_data_ptrs.data_ptr(),
-                    dst_k=self.k_buffer.remote_addr,
-                    src_v_layers=device_pool.v_data_ptrs.data_ptr(),
-                    dst_v=self.v_buffer.remote_addr,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.use_xmem:
+                    swap_kv_all_layer_lf_pf_ptr(
+                        src_k_layers=self.device_k_data_ptrs_cpu.data_ptr(),
+                        dst_k=self.k_buffer.remote_addr,
+                        src_v_layers=self.device_v_data_ptrs_cpu.data_ptr(),
+                        dst_v=self.v_buffer.remote_addr,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
+                else:
+                    transfer_kv_all_layer_lf_pf(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k=self.k_buffer,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v=self.v_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_pool.k_data_ptrs,

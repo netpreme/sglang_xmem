@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
+**/_build/
 **/develop-eggs/
 **/dist/
 **/downloads/
@@ -271,3 +272,5 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+xmem_perf_analysis.md
+XMEM_README.md
