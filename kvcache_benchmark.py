@@ -27,6 +27,57 @@ HIT_PERCENTS_TO_TEST = (0, 20, 40, 60, 80, 100)
 PROMPT_SIZES_IN_K_TO_TEST = (1,) + tuple(range(10, 91, 10))
 
 
+def _print_ttft_table(prompt_sizes_k, prefill_ms, cpu_ms, xmem_ms):
+    col_w = max(8, *(len(f"{s}K") + 2 for s in prompt_sizes_k))
+    label_w = 28
+    sep = "-" * (label_w + col_w * len(prompt_sizes_k) + 1)
+
+    def row(label, values, fmt):
+        cells = "".join(fmt(v).rjust(col_w) for v in values)
+        print(f"{label:<{label_w}}{cells}")
+
+    print()
+    print(sep)
+    row("Prompt length", [f"{s}K" for s in prompt_sizes_k], str)
+    print(sep)
+    row("TTFT (prefill), ms",        prefill_ms, str)
+    row("TTFT (cached, CPU), ms",    cpu_ms,     str)
+    row("TTFT (cached, X-Mem), ms",  xmem_ms,    str)
+    print(sep)
+    speedups = [
+        f"{c/m:.2f}x" if m else "N/A"
+        for c, m in zip(cpu_ms, xmem_ms)
+    ]
+    row("X-Mem Speed-Up", speedups, str)
+    print(sep)
+    print()
+
+
+def _print_tput_table(hit_percents, cpu_tps, xmem_tps):
+    col_w = max(8, *(len(f"{p}%") + 2 for p in hit_percents))
+    label_w = 28
+    sep = "-" * (label_w + col_w * len(hit_percents) + 1)
+
+    def row(label, values, fmt):
+        cells = "".join(fmt(v).rjust(col_w) for v in values)
+        print(f"{label:<{label_w}}{cells}")
+
+    print()
+    print(sep)
+    row("Cache hit %", [f"{p}%" for p in hit_percents], str)
+    print(sep)
+    row("Throughput (CPU), tok/s",   cpu_tps,  str)
+    row("Throughput (X-Mem), tok/s", xmem_tps, str)
+    print(sep)
+    speedups = [
+        f"{m/c:.2f}x" if c else "N/A"
+        for c, m in zip(cpu_tps, xmem_tps)
+    ]
+    row("X-Mem Speed-Up", speedups, str)
+    print(sep)
+    print()
+
+
 def make_sampling_params():
     return {
         "max_new_tokens": NUM_DECODED_TOKENS_PER_PROMPT,
@@ -186,6 +237,13 @@ def main(run_ttft: bool, run_tput: bool, backends=(False, True)):
 
         llm.shutdown()
         torch.cuda.empty_cache()
+        if use_xmem:
+            try:
+                from xmem.mtier_sdk import reset_all
+                reset_all()
+                print("X-Mem allocations released.")
+            except Exception as e:
+                print(f"Warning: failed to reset X-Mem: {e}")
         time.sleep(5)
 
     if ttft_rows:
@@ -196,6 +254,15 @@ def main(run_ttft: bool, run_tput: bool, backends=(False, True)):
             writer.writerows(ttft_rows)
         print(f"TTFT results saved to {path}")
 
+        # Print summary table
+        sizes = list(PROMPT_SIZES_IN_K_TO_TEST)
+        cpu_by_size = {r["prompt_size_k"]: r for r in ttft_rows if r["backend"] == "CPU DRAM"}
+        xmem_by_size = {r["prompt_size_k"]: r for r in ttft_rows if r["backend"] == "X-Mem"}
+        prefill_ms = [cpu_by_size.get(s, xmem_by_size.get(s, {})).get("prefill_time_ms", 0) for s in sizes]
+        cpu_ms = [cpu_by_size.get(s, {}).get("host_load_time_ms", 0) for s in sizes]
+        xmem_ms = [xmem_by_size.get(s, {}).get("host_load_time_ms", 0) for s in sizes]
+        _print_ttft_table(sizes, prefill_ms, cpu_ms, xmem_ms)
+
     if tput_rows:
         path = os.path.join(results_dir, f"tput_{timestamp}.csv")
         with open(path, "w", newline="") as f:
@@ -203,6 +270,14 @@ def main(run_ttft: bool, run_tput: bool, backends=(False, True)):
             writer.writeheader()
             writer.writerows(tput_rows)
         print(f"Throughput results saved to {path}")
+
+        # Print summary table
+        percents = list(HIT_PERCENTS_TO_TEST)
+        cpu_by_pct = {r["hit_percent"]: r for r in tput_rows if r["backend"] == "CPU DRAM"}
+        xmem_by_pct = {r["hit_percent"]: r for r in tput_rows if r["backend"] == "X-Mem"}
+        cpu_tps = [cpu_by_pct.get(p, {}).get("tokens_per_sec", 0) for p in percents]
+        xmem_tps = [xmem_by_pct.get(p, {}).get("tokens_per_sec", 0) for p in percents]
+        _print_tput_table(percents, cpu_tps, xmem_tps)
 
 
 if __name__ == "__main__":
