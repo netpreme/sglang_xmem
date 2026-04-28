@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  # SGLang hbm-only: GPU HBM only, no KV offload
+  - job_name: sglang_hbm_only
+    static_configs:
+      - targets: ["localhost:8000"]
+        labels:
+          setup: "hbm-only"
+    metrics_path: /metrics
+
+  # SGLang hybrid-cpu: GPU HBM + CPU DRAM hierarchical cache
+  - job_name: sglang_hybrid_cpu
+    static_configs:
+      - targets: ["localhost:8001"]
+        labels:
+          setup: "hybrid-cpu"
+    metrics_path: /metrics
+
+  # SGLang hybrid-mtier: GPU HBM + MTier chip hierarchical cache
+  - job_name: sglang_hybrid_mtier
+    static_configs:
+      - targets: ["localhost:8002"]
+        labels:
+          setup: "hybrid-mtier"
+    metrics_path: /metrics
