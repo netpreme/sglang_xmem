@@ -1,3 +1,8 @@
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
+    AscendOpsCombineInput,
+    AscendOpsDispatcher,
+    AscendOpsDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -7,6 +12,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputChecker,
     DispatchOutputFormat,
+    RoutewiseCombineInput,
+    RoutewiseLayout,
 )
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
@@ -16,11 +23,15 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
+    DeepEPv2CombineInput,
+    DeepEPv2Dispatcher,
+    DeepEPv2DispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
@@ -28,8 +39,20 @@ from sglang.srt.layers.moe.token_dispatcher.mooncake import (
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPDispatcher,
+    MoriEPLLCombineInput,
+    MoriEPLLDispatchOutput,
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
+)
+from sglang.srt.layers.moe.token_dispatcher.nixl import (
+    NixlEPCombineInput,
+    NixlEPDispatcher,
+    NixlEPDispatchOutput,
+)
+from sglang.srt.layers.moe.token_dispatcher.pplx import (
+    PplxCombineInput,
+    PplxDispatcher,
+    PplxDispatchOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -46,6 +69,8 @@ __all__ = [
     "DispatchOutput",
     "DispatchOutputFormat",
     "DispatchOutputChecker",
+    "RoutewiseCombineInput",
+    "RoutewiseLayout",
     "FlashinferDispatchOutput",
     "FlashinferDispatcher",
     "MooncakeCombineInput",
@@ -53,7 +78,18 @@ __all__ = [
     "MooncakeEPDispatcher",
     "MoriEPNormalDispatchOutput",
     "MoriEPNormalCombineInput",
+    "MoriEPLLDispatchOutput",
+    "MoriEPLLCombineInput",
     "MoriEPDispatcher",
+    "DeepEPv2Dispatcher",
+    "DeepEPv2DispatchOutput",
+    "DeepEPv2CombineInput",
+    "NixlEPCombineInput",
+    "NixlEPDispatchOutput",
+    "NixlEPDispatcher",
+    "PplxCombineInput",
+    "PplxDispatchOutput",
+    "PplxDispatcher",
     "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
@@ -63,5 +99,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
-    "NpuFuseEPDispatcher",
+    "AscendOpsDispatcher",
+    "AscendOpsDispatchOutput",
+    "AscendOpsCombineInput",
 ]

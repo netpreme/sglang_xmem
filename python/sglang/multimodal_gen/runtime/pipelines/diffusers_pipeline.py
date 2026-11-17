@@ -10,11 +10,9 @@ import argparse
 import inspect
 import re
 import warnings
-from io import BytesIO
 from typing import Any
 
 import numpy as np
-import requests
 import torch
 import torchvision.transforms as T
 from diffusers import DiffusionPipeline
@@ -22,6 +20,15 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    resolve_diffusers_pipeline_offload,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -33,10 +40,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.vision import load_image as load_vision_image
 
 logger = init_logger(__name__)
 
@@ -51,7 +63,7 @@ class DiffusersExecutionStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Execute the diffusers pipeline."""
 
-        kwargs = self._build_pipeline_kwargs(batch, server_args)
+        kwargs = self._build_pipeline_kwargs(batch)
 
         # Filter kwargs to only those supported by the pipeline, warn about ignored args
         kwargs, _ = self._filter_pipeline_kwargs(kwargs)
@@ -79,8 +91,8 @@ class DiffusersExecutionStage(PipelineStage):
         return batch
 
     def _filter_pipeline_kwargs(
-        self, kwargs: dict, *, strict: bool = False
-    ) -> tuple[dict, list[str]]:
+        self, kwargs: dict[str, Any], *, strict: bool = False
+    ) -> tuple[dict[str, Any], list[str]]:
         """Filter kwargs to those accepted by the pipeline's __call__.
 
         Args:
@@ -127,15 +139,13 @@ class DiffusersExecutionStage(PipelineStage):
     def _extract_output(self, output: Any) -> torch.Tensor | None:
         """Extract tensor output from pipeline result."""
         for attr in ["images", "frames", "video", "sample", "pred_original_sample"]:
-            if not hasattr(output, attr):
-                continue
-
-            data = getattr(output, attr)
+            data = getattr(output, attr, None)
             if data is None:
                 continue
 
             result = self._convert_to_tensor(data)
             if result is not None:
+                result = self._to_output_layout(result, attr in ("frames", "video"))
                 logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
@@ -148,7 +158,11 @@ class DiffusersExecutionStage(PipelineStage):
         return None
 
     def _convert_to_tensor(self, data: Any) -> torch.Tensor | None:
-        """Convert various data formats to a tensor."""
+        """Convert various data formats to a channels-first tensor.
+
+        Images come out as (B, C, H, W) and videos as (B, T, C, H, W);
+        _to_output_layout then maps them to the final output layout.
+        """
         if isinstance(data, torch.Tensor):
             return data
 
@@ -156,14 +170,14 @@ class DiffusersExecutionStage(PipelineStage):
             tensor = torch.from_numpy(data).float()
             if tensor.max() > 1.0:
                 tensor = tensor / 255.0
-            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, C, T, H, W)
+            # (B, H, W, C) -> (B, C, H, W), (B, T, H, W, C) -> (B, T, C, H, W)
             if tensor.ndim == 4:
                 tensor = tensor.permute(0, 3, 1, 2)
             elif tensor.ndim == 5:
-                tensor = tensor.permute(0, 4, 1, 2, 3)
+                tensor = tensor.permute(0, 1, 4, 2, 3)
             return tensor
 
-        if hasattr(data, "mode"):  # PIL Image
+        if isinstance(data, Image.Image):
             return T.ToTensor()(data)
 
         if isinstance(data, list) and len(data) > 0:
@@ -175,36 +189,40 @@ class DiffusersExecutionStage(PipelineStage):
         """Convert a list of items to a tensor."""
         first = data[0]
 
-        # Nested list (e.g., [[frame1, frame2, ...]] for video batches)
-        if isinstance(first, list) and len(first) > 0:
-            data = first
-            first = data[0]
+        # A nested list (e.g., [[frame1, frame2, ...], ...]) is a batch of
+        # videos, stacked to (B, T, C, H, W); a flat list is a batch of images.
+        if isinstance(first, list):
+            videos = [self._convert_to_tensor(video) for video in data]
+            if any(video is None for video in videos):
+                return None
+            return torch.stack(videos)
 
-        if hasattr(first, "mode"):  # PIL images
-            tensors = [T.ToTensor()(img) for img in data]
-            stacked = torch.stack(tensors)
-            if len(tensors) > 1:
-                return stacked.permute(1, 0, 2, 3)  # (T, C, H, W) -> (C, T, H, W)
-            return stacked[0]
-
-        if isinstance(first, torch.Tensor):
+        if isinstance(first, Image.Image):
+            stacked = torch.stack([T.ToTensor()(img) for img in data])
+        elif isinstance(first, torch.Tensor):
             stacked = torch.stack(data)
-            if len(data) > 1:
-                return stacked.permute(1, 0, 2, 3)
-            return stacked[0]
-
-        if isinstance(first, np.ndarray):
+        elif isinstance(first, np.ndarray):
             tensors = [torch.from_numpy(arr).float() for arr in data]
             if tensors[0].max() > 1.0:
                 tensors = [t / 255.0 for t in tensors]
             if tensors[0].ndim == 3:
                 tensors = [t.permute(2, 0, 1) for t in tensors]
             stacked = torch.stack(tensors)
-            if len(data) > 1:
-                return stacked.permute(1, 0, 2, 3)
-            return stacked[0]
+        else:
+            return None
 
-        return None
+        return stacked
+
+    @staticmethod
+    def _to_output_layout(tensor: torch.Tensor, is_video: bool) -> torch.Tensor:
+        """Map a channels-first tensor to (B, C, H, W) or (B, C, T, H, W)."""
+        if tensor.dim() == 5:
+            # (B, T, C, H, W) -> (B, C, T, H, W)
+            return tensor.permute(0, 2, 1, 3, 4)
+        if is_video and tensor.dim() == 4:
+            # A single video, (T, C, H, W) -> (1, C, T, H, W)
+            return tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        return tensor
 
     def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
         """Post-process output tensor to ensure valid values and correct shape."""
@@ -231,18 +249,9 @@ class DiffusersExecutionStage(PipelineStage):
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
         """Fix tensor shape for downstream processing.
 
-        Expected: (B, C, H, W) for images or (B, C, T, H, W) for videos.
+        4D and 5D outputs are already in the final layout from
+        _to_output_layout; this only expands lower-rank images to (B, C, H, W).
         """
-        if output.dim() == 5:
-            # Video: (B, T, C, H, W) -> (B, C, T, H, W)
-            return output.permute(0, 2, 1, 3, 4)
-
-        if output.dim() == 4:
-            if output.shape[0] == 1 or output.shape[1] in [1, 3, 4]:
-                return output  # Already (B, C, H, W)
-            # (T, C, H, W) -> (1, C, T, H, W)
-            return output.unsqueeze(0).permute(0, 2, 1, 3, 4)
-
         if output.dim() == 3:
             c, h, w = output.shape
             if c > 4 and w <= 4:
@@ -256,7 +265,7 @@ class DiffusersExecutionStage(PipelineStage):
 
         return output
 
-    def _build_pipeline_kwargs(self, batch: Req, server_args: ServerArgs) -> dict:
+    def _build_pipeline_kwargs(self, batch: Req) -> dict[str, Any]:
         """Build kwargs dict for diffusers pipeline call."""
         kwargs = {}
 
@@ -288,7 +297,7 @@ class DiffusersExecutionStage(PipelineStage):
         if batch.generator is not None:
             kwargs["generator"] = batch.generator
         elif batch.seed is not None:
-            device = self._get_pipeline_device()
+            device = self._get_generator_device(batch)
             kwargs["generator"] = torch.Generator(device=device).manual_seed(batch.seed)
 
         # Image input for img2img or inpainting
@@ -307,16 +316,16 @@ class DiffusersExecutionStage(PipelineStage):
 
         return kwargs
 
-    def _get_pipeline_device(self) -> str:
-        """Get the device the pipeline is running on."""
-        for attr in ["unet", "transformer", "vae"]:
-            component = getattr(self.diffusers_pipe, attr, None)
-            if component is not None:
-                try:
-                    return next(component.parameters()).device
-                except StopIteration:
-                    pass
-        return "cuda" if torch.cuda.is_available() else "cpu"
+    def _get_generator_device(self, batch: Req) -> str:
+        """Resolve RNG device consistently with the non-diffusers path.
+
+        Diffusers CPU offload can temporarily park modules on CPU, but that
+        should not silently switch a CUDA request to CPU RNG, otherwise the
+        same seed produces different outputs depending on runtime placement.
+        """
+        if batch.generator_device == "cpu":
+            return "cpu"
+        return current_platform.device_type
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
@@ -337,11 +346,8 @@ class DiffusersExecutionStage(PipelineStage):
             batch.image_path = batch.image_path[0]
 
         try:
-            if batch.image_path.startswith(("http://", "https://")):
-                response = requests.get(batch.image_path, timeout=30)
-                response.raise_for_status()
-                return Image.open(BytesIO(response.content)).convert("RGB")
-            return Image.open(batch.image_path).convert("RGB")
+            image = load_vision_image(batch.image_path)
+            return image.convert("RGB")
         except Exception as e:
             logger.error("Failed to load image from %s: %s", batch.image_path, e)
             return None
@@ -367,20 +373,32 @@ class DiffusersPipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
     ):
+        if server_args.has_requested_component_attention_backends():
+            raise ValueError(
+                "--component-attention-backends is supported only by native "
+                "SGLang diffusion pipelines; use --attention-backend with the "
+                "Diffusers backend"
+            )
         self.server_args = server_args
+        self._disagg_role = server_args.disagg_role
         self.model_path = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.modules: dict[str, Any] = {}
         self.memory_usages: dict[str, float] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
+        self.component_residency_manager = None
         self.post_init_called = False
         self.executor = executor or SyncExecutor(server_args=server_args)
+        self._cache_dit_enabled = False
 
         logger.info("Loading diffusers pipeline from %s", model_path)
         self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
         self._detect_pipeline_type()
 
-    def _load_diffusers_pipeline(self, model_path: str, server_args: ServerArgs) -> Any:
+    def _load_diffusers_pipeline(
+        self, model_path: str, server_args: ServerArgs
+    ) -> DiffusionPipeline:
         """Load the diffusers pipeline.
 
         Optimizations applied:
@@ -391,7 +409,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         """
 
         original_model_path = model_path  # Keep original for custom_pipeline
-        model_path = maybe_download_model(model_path)
+        model_path = maybe_download_model(model_path, force_diffusers_model=True)
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
@@ -405,14 +423,10 @@ class DiffusersPipeline(ComposedPipelineBase):
         }
 
         # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
-        config = server_args.pipeline_config
-        if config is not None:
-            quant_config = getattr(config, "quantization_config", None)
-            if quant_config is not None:
-                load_kwargs["quantization_config"] = quant_config
-                logger.info(
-                    "Using quantization config: %s", type(quant_config).__name__
-                )
+        quant_config = getattr(server_args.pipeline_config, "quantization_config", None)
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+            logger.info("Using quantization config: %s", type(quant_config).__name__)
 
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, **load_kwargs)
@@ -452,37 +466,83 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        pipe = pipe.to(get_local_torch_device())
+        # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        explicit_pipeline_offload = resolve_diffusers_pipeline_offload(
+            server_args.component_residency
+        )
+        any_offload = (
+            explicit_pipeline_offload
+            if explicit_pipeline_offload is not None
+            else any(
+                server_args.should_cpu_offload_component(component_name)
+                for component_name in {
+                    *pipe.components,
+                    "transformer",
+                    "text_encoder",
+                    "image_encoder",
+                    "vae",
+                }
+            )
+        )
+        if any_offload:
+            device = get_local_torch_device()
+            gpu_id = device.index if device.index is not None else 0
+            pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+            logger.info(
+                "Enabled model CPU offload for diffusers pipeline (gpu_id=%d)", gpu_id
+            )
+        else:
+            pipe = pipe.to(get_local_torch_device())
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
         # Apply cache-dit acceleration if configured
         pipe = self._apply_cache_dit(pipe, server_args)
+        # Apply torch.compile if enabled and supported
+        pipe = self._apply_torch_compile(pipe, server_args)
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
-    def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
+    def _apply_vae_optimizations(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> None:
         """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
         config = server_args.pipeline_config
-        if config is None:
-            return
 
         # VAE slicing: decode latents slice-by-slice for lower peak memory
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-slicing
-        if getattr(config, "vae_slicing", False):
-            if hasattr(pipe, "enable_vae_slicing"):
+        if config.vae_slicing:
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+                logger.info("Enabled VAE slicing for lower memory usage")
+            elif hasattr(pipe, "enable_vae_slicing"):
                 pipe.enable_vae_slicing()
                 logger.info("Enabled VAE slicing for lower memory usage")
+            else:
+                logger.warning(
+                    "VAE slicing is not available: neither "
+                    "`pipe.vae.enable_slicing()` nor `pipe.enable_vae_slicing()` was found."
+                )
 
         # VAE tiling: decode latents tile-by-tile for large images
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-tiling
-        if getattr(config, "vae_tiling", False):
-            if hasattr(pipe, "enable_vae_tiling"):
+        if config.vae_tiling:
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling()
+                logger.info("Enabled VAE tiling for large image support")
+            elif hasattr(pipe, "enable_vae_tiling"):
                 pipe.enable_vae_tiling()
                 logger.info("Enabled VAE tiling for large image support")
+            else:
+                logger.warning(
+                    "VAE tiling is not available: neither "
+                    "`pipe.vae.enable_tiling()` nor `pipe.enable_vae_tiling()` was found."
+                )
 
-    def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
+    def _apply_attention_backend(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> None:
         """Apply attention backend setting from pipeline config or server_args.
 
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
@@ -491,9 +551,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         backend = server_args.attention_backend
 
         if backend is None:
-            config = server_args.pipeline_config
-            if config is not None:
-                backend = getattr(config, "diffusers_attention_backend", None)
+            backend = getattr(
+                server_args.pipeline_config, "diffusers_attention_backend", None
+            )
 
         if backend is None:
             return
@@ -528,7 +588,9 @@ class DiffusersPipeline(ComposedPipelineBase):
                         e,
                     )
 
-    def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
+    def _apply_cache_dit(
+        self, pipe: DiffusionPipeline, server_args: ServerArgs
+    ) -> DiffusionPipeline:
         """Enable cache-dit for diffusers pipeline if configured."""
         cache_dit_config = server_args.cache_dit_config
         if not cache_dit_config:
@@ -564,26 +626,80 @@ class DiffusersPipeline(ComposedPipelineBase):
             raise
 
         logger.info("Enabled cache-dit for diffusers pipeline")
+        self._cache_dit_enabled = True
+        return pipe
+
+    def _apply_torch_compile(self, pipe: Any, server_args: ServerArgs) -> Any:
+        """Apply torch.compile to the pipeline if configured and supported."""
+        if not server_args.enable_torch_compile:
+            return pipe
+
+        # check if the pipeline has 'transformer' or 'unet' components which are
+        # typically the most expensive parts to compile. 'transformer_2' for some
+        # video pipelines, e.g, Wan 2.2 series, also check for that.
+        compilable_components = ["transformer", "transformer_2", "unet"]
+        if not any(hasattr(pipe, comp) for comp in compilable_components):
+            logger.warning(
+                "Pipeline does not have 'transformer' or 'unet' components. "
+                "torch.compile may not provide significant benefits and could increase latency."
+            )
+            return pipe
+
+        if self._cache_dit_enabled:
+            try:
+                import cache_dit
+
+                if hasattr(cache_dit, "set_compile_configs"):
+                    cache_dit.set_compile_configs()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to set torch_compile configs for cache-dit: {e}"
+                )
+
+        for comp in compilable_components:
+            if hasattr(pipe, comp):
+                try:
+                    component = getattr(pipe, comp)
+                    repeated_blocks = getattr(component, "_repeated_blocks", None)
+                    if (
+                        isinstance(component, torch.nn.Module)
+                        and repeated_blocks
+                        and hasattr(component, "compile_repeated_blocks")
+                    ):
+                        # Regional compilation: compile a single instance of each
+                        # repeated transformer block and let inductor's cache reuse
+                        # it for all repeats, instead of compiling the whole DiT as
+                        # one graph
+                        component.compile_repeated_blocks()
+                    elif isinstance(component, torch.nn.Module) and hasattr(
+                        component, "compile"
+                    ):
+                        # Prefer in-place compilation if supported. According to PyTorch documentation:
+                        # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
+                        component.compile()
+                    else:
+                        compiled_component = torch.compile(component)
+                        setattr(pipe, comp, compiled_component)
+                    logger.info(
+                        f"Applied torch.compile to {comp} component of the pipeline"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply torch.compile to {comp}: {e}")
+
         return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
         """
         Determine the dtype to use for model loading.
         """
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
-            dit_precision = server_args.pipeline_config.dit_precision
-            if dit_precision == "fp16":
-                dtype = torch.float16
-            elif dit_precision == "bf16":
-                dtype = torch.bfloat16
-            elif dit_precision == "fp32":
-                dtype = torch.float32
+            return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
-        return dtype
+        # precision-constraint: legacy fallback for callers without pipeline_config;
+        # prefer explicit dit_precision policy when available.
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    def _detect_pipeline_type(self):
+    def _detect_pipeline_type(self) -> None:
         """Detect if this is an image or video pipeline."""
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
@@ -601,15 +717,12 @@ class DiffusersPipeline(ComposedPipelineBase):
         """Skip sglang's module loading - diffusers handles it."""
         return {"diffusers_pipeline": self.diffusers_pipe}
 
-    def create_pipeline_stages(self, server_args: ServerArgs):
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         """Create the execution stage wrapping the diffusers pipeline."""
         self.add_stage(
-            DiffusersExecutionStage(self.diffusers_pipe), "diffusers_execution"
+            stage_name="diffusers_execution",
+            stage=DiffusersExecutionStage(self.diffusers_pipe),
         )
-
-    def initialize_pipeline(self, server_args: ServerArgs):
-        """Initialize the pipeline."""
-        pass
 
     def post_init(self) -> None:
         """Post initialization hook."""
@@ -620,29 +733,27 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.create_pipeline_stages(self.server_args)
 
     def add_stage(
-        self, stage: PipelineStage, stage_name: str | None = None
+        self,
+        stage: PipelineStage | str,
+        stage_name: str | PipelineStage | None = None,
     ) -> "DiffusersPipeline":
-        """Add a stage to the pipeline."""
-        if stage_name is None:
-            stage_name = self._infer_stage_name(stage)
-        if stage_name in self._stage_name_mapping:
-            raise ValueError(f"Duplicate stage name detected: {stage_name}")
-
-        self._stages.append(stage)
-        self._stage_name_mapping[stage_name] = stage
-        return self
-
-    @property
-    def stages(self) -> list[PipelineStage]:
-        """List of stages in the pipeline."""
-        return self._stages
+        # Also accept the legacy add_stage(stage_name, stage) order.
+        if isinstance(stage, str) and isinstance(stage_name, PipelineStage):
+            stage, stage_name = stage_name, stage
+        return super().add_stage(stage, stage_name)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Execute the pipeline on the given batch."""
         if not self.post_init_called:
             self.post_init()
-        return self.executor.execute(self.stages, batch, server_args)
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
     @classmethod
     def from_pretrained(

@@ -6,12 +6,10 @@ This module provides generic sampling parameters that work with any diffusers pi
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 
 
 @dataclass
@@ -25,6 +23,9 @@ class DiffusersGenericSamplingParams(SamplingParams):
     For pipeline-specific parameters, use `diffusers_kwargs` dict which will be
     passed directly to the diffusers pipeline call.
     """
+
+    _default_height: ClassVar[int] = 1024
+    _default_width: ClassVar[int] = 1024
 
     # Override defaults with more conservative values that work across pipelines
     num_frames: int = 1  # default to image generation
@@ -44,9 +45,4 @@ class DiffusersGenericSamplingParams(SamplingParams):
         else:
             self.data_type = DataType.IMAGE
 
-        if self.width is None:
-            self.width_not_provided = True
-            self.width = 1024
-        if self.height is None:
-            self.height_not_provided = True
-            self.height = 1024
+        super().__post_init__()

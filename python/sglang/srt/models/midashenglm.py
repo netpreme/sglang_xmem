@@ -1,6 +1,7 @@
 import collections
 import collections.abc
 import logging
+from array import array
 from collections.abc import Callable, Sequence
 from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
 
@@ -10,21 +11,19 @@ import torchaudio.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -32,9 +31,9 @@ _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
 
 def _resolve_tuple2(x: _Tuple2) -> tuple[int, int]:
     if isinstance(x, collections.abc.Sequence):
-        assert (
-            len(x) == 2
-        ), f"Expected a sequence of length 2, got {x} with length {len(x)}"
+        assert len(x) == 2, (
+            f"Expected a sequence of length 2, got {x} with length {len(x)}"
+        )
         return cast(tuple[int, int], tuple(x))
     return (x, x)
 
@@ -79,7 +78,7 @@ class AudioPatchEmbed(nn.Module):
         )
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_chans,
             embed_dim,
             kernel_size=self.patch_size,
@@ -377,9 +376,9 @@ class DashengAudioTransformer(nn.Module):
         t = x.shape[-1]
         input_splits = x.split(target_length_in_patches, dim=-1)
         if x_length is not None:
-            assert len(x_length) == len(
-                x
-            ), "batchsizes of input x and x_length need to be same"
+            assert len(x_length) == len(x), (
+                "batchsizes of input x and x_length need to be same"
+            )
             assert x_length.ndim == 1, "Lengths are of size (B,)"
             scaled_lengths = (x_length / (self.hop_length * 4)).long()
             mask = self._to_mask(max_length=t, lengths=scaled_lengths)
@@ -475,20 +474,12 @@ class MiDashengLMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if (
-            hasattr(config.text_config, "rope_scaling")
-            and config.text_config.rope_scaling
-        ):
-            if "mrope_section" in config.text_config.rope_scaling:
-
-                new_rope_scaling = {
-                    k: v
-                    for k, v in config.text_config.rope_scaling.items()
-                    if k != "mrope_section"
-                }
-                config.text_config.rope_scaling = (
-                    new_rope_scaling if new_rope_scaling else None
-                )
+        rope_scaling = config.text_config.rope_parameters
+        if rope_scaling:
+            if "mrope_section" in rope_scaling:
+                # Remove mrope_section from rope_parameters so downstream
+                # code treats this as standard rotary embedding.
+                del rope_scaling["mrope_section"]
         self.audio_encoder = DashengAudioTransformer(
             config.audio_encoder_config,
             quant_config=quant_config,
@@ -509,10 +500,9 @@ class MiDashengLMModel(nn.Module):
         self.logits_processor = self.language_model.logits_processor
         self.quant_config = quant_config
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input IDs with multimodal tokens."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process audio inputs and return embeddings.

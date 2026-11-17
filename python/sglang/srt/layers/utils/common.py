@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import re
+from typing import Any, Dict, Optional
 
 import torch
+from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,72 @@ def pad_or_narrow_weight(
     )
 
 
+def is_strict_contiguous(x: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(x.shape), reversed(x.stride())):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def strict_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if is_strict_contiguous(x):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
+def copy_or_rebind_param(
+    module: torch.nn.Module, name: str, new_value: torch.Tensor
+) -> None:
+    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
+    new_value = new_value.detach()
+    param = getattr(module, name, None)
+    if isinstance(param, Parameter):
+        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
+            param.data.copy_(new_value)
+        else:
+            param.data = new_value
+        param.requires_grad_(False)
+    else:
+        setattr(module, name, Parameter(new_value, requires_grad=False))
+
+
+def alias_or_bind_derived_param(
+    module: torch.nn.Module,
+    source_name: str,
+    derived_name: str,
+    derived_value: torch.Tensor,
+) -> None:
+    """Bind a post-processed (derived) tensor to a derived attribute name.
+
+    When `derived_value` is broadcastable to the source Parameter's shape (and
+    dtype matches), write it broadcast-filled into the source's storage in
+    place and register `derived_name` as an alias of the source Parameter. The
+    two attribute names then share one underlying buffer, so:
+      - apply() can read via `derived_name`
+      - update_weights_from_disk can keep refilling `source_name` (the loader
+        re-runs process_weights_after_loading which re-derives in place)
+      - peak GPU memory is the source size, not source + derived.
+
+    When the shapes are not broadcast-compatible, fall back to allocating a
+    separate Parameter under `derived_name` via copy_or_rebind_param.
+    """
+    derived_value = derived_value.detach()
+    source = getattr(module, source_name, None)
+    if isinstance(source, Parameter) and source.data.dtype == derived_value.dtype:
+        try:
+            broadcast = torch.broadcast_to(derived_value, source.data.shape)
+        except RuntimeError:
+            broadcast = None
+        if broadcast is not None:
+            source.data.copy_(broadcast)
+            source.requires_grad_(False)
+            setattr(module, derived_name, source)
+            return
+    copy_or_rebind_param(module, derived_name, derived_value)
+
+
 class PPMissingLayer(torch.nn.Identity):
     # Adapted from
     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
@@ -56,3 +126,36 @@ class PPMissingLayer(torch.nn.Identity):
         """
         input = args[0] if args else next(iter(kwargs.values()))
         return (input,) if self.return_tuple else input
+
+
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        setattr(weight, key, value)
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"

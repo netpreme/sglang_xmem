@@ -8,7 +8,7 @@ VLMs tested here:
 - Qwen VL series (Qwen2-VL-7B, Qwen2.5-VL-7B, Qwen3-VL-30B)
 - InternVL2 series (InternVL2_5-2B)
 - MiniCPM series (MiniCPM-v-2_6, MiniCPM-o-2_6)
-- DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B)
+- DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B, DeepSeek-OCR-2)
 - Kimi VL (Kimi-VL-A3B-Instruct)
 - MiMo VL (MiMo-VL-7B-RL)
 - GLM VL (GLM-4.1V-9B-Thinking)
@@ -116,13 +116,28 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.27,
         "extra_args": ["--trust-remote-code"],
     },
+    # DeepSeek-OCR-2 - last to avoid memory pressure on subsequent models
+    {
+        "model_path": "deepseek-ai/DeepSeek-OCR-2",
+        "tp_size": 1,
+        "accuracy_threshold": 0.25,
+        "extra_args": [
+            "--trust-remote-code",
+            "--disable-cuda-graph",
+            "--mem-fraction-static",
+            "0.70",
+            "--max-total-tokens",
+            "16384",
+        ],
+    },
 ]
 
-# Models that need special handling on AMD (MoE models)
+# Models that need triton attention on AMD (aiter pa_ragged JIT compilation OOMs)
 TRITON_ATTENTION_MODELS = {
     # "deepseek-ai/deepseek-vl2-small",
     # "Qwen/Qwen3-VL-30B-A3B-Instruct",
     # "moonshotai/Kimi-VL-A3B-Instruct",
+    "deepseek-ai/DeepSeek-OCR-2",
 }
 
 # Models known to fail on AMD - exclude from testing
@@ -157,14 +172,14 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
         all_results = []
         total_test_start = time.time()
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("AMD VLM MMMU Evaluation Test")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Benchmark: MMMU (100 samples)")
         print(f"Models to test: {len(self.models)}")
         for m in self.models:
             print(f"  - {m['model_path']} (TP={m['tp_size']})")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         for model_config in self.models:
             model_path = model_config["model_path"]
@@ -174,9 +189,9 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
             error_message = None
 
             with self.subTest(model=model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {model_path} (TP={tp_size})")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 model_start = time.time()
                 startup_time = None
@@ -214,7 +229,10 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
                         eval_name="mmmu",
                         num_examples=100,
                         num_threads=64,
-                        max_tokens=30,
+                        # The MMMU prompt asks for step-by-step reasoning ending in
+                        # "Answer: X" (#21841); 30 tokens truncated it before the
+                        # answer, so the parser fell back to "A" for every model.
+                        max_tokens=1024,
                     )
 
                     # Run evaluation with timing
@@ -343,21 +361,21 @@ class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
 
             summary += f"| {model} | {tp_size} | {score_str} | {threshold:.2f} | {startup_str} | {eval_str} | {total_str} | {status} |\n"
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("SUMMARY - AMD VLM MMMU Evaluation")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(summary)
         print(f"\n📊 Final Statistics:")
         print(f"   Passed: {passed_count}")
         print(f"   Failed: {failed_count}")
         print(
-            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
         )
 
         if is_in_ci():
             write_github_step_summary(
                 f"### TestNightlyVLMMmmuEvalAMD\n{summary}\n\n"
-                f"**Total Runtime:** {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+                f"**Total Runtime:** {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
             )
 
         if failed_models:

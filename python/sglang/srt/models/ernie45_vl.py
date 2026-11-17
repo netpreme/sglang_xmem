@@ -13,6 +13,7 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -23,24 +24,29 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -81,7 +86,6 @@ class Ernie4_5_VisionMLP(nn.Module):
 
 
 class Ernie4_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -120,14 +124,18 @@ class Ernie4_5_VisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        position_embeddings: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -136,7 +144,6 @@ class Ernie4_5_VisionBlock(nn.Module):
 
 
 class Ernie4_5_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -343,7 +350,6 @@ class VariableResolutionResamplerModel(nn.Module):
 
 
 class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.inv_freq = 1.0 / theta ** (
@@ -359,7 +365,6 @@ class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: PretrainedConfig,
@@ -388,7 +393,13 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = embed_dim // num_heads
-        self.rotary_pos_emb = Ernie4_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = get_rope(
+            head_size=head_dim,
+            rotary_dim=head_dim // 2,
+            max_position=8192,
+            base=10000.0,
+            is_neox_style=True,
+        )
         self.blocks = nn.ModuleList(
             [
                 Ernie4_5_VisionBlock(
@@ -413,7 +424,9 @@ class Ernie4_5_VisionTransformer(nn.Module):
     def device(self) -> torch.device:
         return self.blocks[0].mlp.fc2.weight.device
 
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def rot_pos_emb(
+        self, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pos_ids = []
         for i in range(grid_thw.size(0)):
             t, h, w = grid_thw[i].tolist()
@@ -440,11 +453,15 @@ class Ernie4_5_VisionTransformer(nn.Module):
                 .flatten()
             )
             pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
+        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
         max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
+
+        # Use pre-computed cos_sin_cache from RotaryEmbedding
+        cos, sin = self.rotary_pos_emb.get_cos_sin(max_grid_size)
+
+        cos_combined = cos[pos_ids].flatten(1)
+        sin_combined = sin[pos_ids].flatten(1)
+        return cos_combined, sin_combined, pos_ids
 
     def forward(
         self,
@@ -456,19 +473,30 @@ class Ernie4_5_VisionTransformer(nn.Module):
         x = self.patch_embed(x)
 
         # compute position embedding
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        rotary_pos_emb_cos, rotary_pos_emb_sin, image_type_ids = self.rot_pos_emb(
+            grid_thw
+        )
+        rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
+        rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         # transformers
         x = x.unsqueeze(1)
         for blk in self.blocks:
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
+            )
 
         final_output = self.ln(x)
 
@@ -561,9 +589,8 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         else:
             self._visual_token_ids_tensor_cache = None
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def _vision_forward(
         self,
@@ -625,12 +652,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
         pad_values = []
-        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             for mm_input in forward_batch.mm_inputs:
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items:
-                    pad_values.append(item.pad_value)
+                    pad_values.extend(item.padding_values())
         placeholder_tensor = torch.as_tensor(
             pad_values,
             device=input_ids.device,
@@ -681,11 +708,18 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        self._set_visual_token_mask(input_ids, forward_batch)
+        # Skip on decode/text-only batches: per-step mask allocs exhaust XPU memory.
+        if not forward_batch.forward_mode.is_decode() and (
+            forward_batch.contains_image_inputs()
+            or forward_batch.contains_video_inputs()
+        ):
+            self._set_visual_token_mask(input_ids, forward_batch)
+        else:
+            self.visual_token_mask = None
 
-        assert (
-            input_ids.numel() == positions.shape[-1]
-        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        assert input_ids.numel() == positions.shape[-1], (
+            f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

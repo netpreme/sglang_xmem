@@ -6,17 +6,25 @@ HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_FAMILY="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU family from AMD_CI_GPU_ARCH: ${GPU_FAMILY}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
   echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test/srt"
+WORKDIR="/sglang-checkout/test"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
+  # Disabled on AMD: the async-assert probes (#27461) fire torch._assert_async in
+  # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
+  # exception.
+  [SGLANG_ENABLE_ASYNC_ASSERT]=0
   [SGLANG_USE_AITER]=1
 )
 

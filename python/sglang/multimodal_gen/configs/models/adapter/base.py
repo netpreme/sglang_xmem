@@ -22,10 +22,16 @@ class AdapterArchConfig(ArchConfig):
             AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.FA,
             AttentionBackendEnum.AITER,
+            AttentionBackendEnum.AITER_SAGE,
+            AttentionBackendEnum.AITER_QUANT,
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.AMX_ATTN,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SAGE_ATTN_3,
+            AttentionBackendEnum.LASER_ATTN,
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
         }
     )
 

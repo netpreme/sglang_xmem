@@ -1,9 +1,37 @@
-# SGLang public APIs
+"""SGLang public API."""
 
-# Frontend Language APIs
-from sglang.global_config import global_config
+import platform as _platform
+import sys as _sys
+
+from sglang.srt.debug_utils.rocprofiler_register import torch_built_with_hip as _is_hip
+
+# sglang.srt.environ must run before anything imports torch or FlashInfer:
+# those claim these cache dirs early, and the first value set is the one that
+# sticks. Safe here -- environ has no heavy dependency (no torch).
+from sglang.srt.environ import (
+    redirect_third_party_caches as _redirect_third_party_caches,
+)
+
+_redirect_third_party_caches()
+
+from sglang._logging_once import install_logging_once as _install_logging_once
+
+_install_logging_once()
+
+if _is_hip():
+    from sglang.srt.debug_utils.rocprofiler_register import (
+        clear_inherited_rocprofiler_registration as _clear_inherited_rocprofiler_registration,
+    )
+
+    _clear_inherited_rocprofiler_registration()
+
+if _sys.platform == "darwin" and _platform.machine() == "arm64":
+    from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
+
+    _install_platform_stubs()
+
+from sglang._lazy_import import LazyImport
 from sglang.lang.api import (
-    Engine,
     Runtime,
     assistant,
     assistant_begin,
@@ -32,23 +60,31 @@ from sglang.lang.choices import (
     token_length_normalized,
     unconditional_likelihood_normalized,
 )
-
-# Lazy import some libraries
-from sglang.utils import LazyImport
+from sglang.lang.global_config import global_config
 from sglang.version import __version__
 
+# Lazy backend clients
 Anthropic = LazyImport("sglang.lang.backend.anthropic", "Anthropic")
+Crusoe = LazyImport("sglang.lang.backend.crusoe", "Crusoe")
 LiteLLM = LazyImport("sglang.lang.backend.litellm", "LiteLLM")
 OpenAI = LazyImport("sglang.lang.backend.openai", "OpenAI")
 VertexAI = LazyImport("sglang.lang.backend.vertexai", "VertexAI")
 
-# Runtime Engine APIs
+# Runtime API
 ServerArgs = LazyImport("sglang.srt.server_args", "ServerArgs")
 Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 
 __all__ = [
+    "Anthropic",
+    "Crusoe",
     "Engine",
+    "LiteLLM",
+    "OpenAI",
     "Runtime",
+    "RuntimeEndpoint",
+    "ServerArgs",
+    "VertexAI",
+    "__version__",
     "assistant",
     "assistant_begin",
     "assistant_end",
@@ -58,6 +94,8 @@ __all__ = [
     "gen_int",
     "gen_string",
     "get_server_info",
+    "global_config",
+    "greedy_token_selection",
     "image",
     "select",
     "separate_reasoning",
@@ -65,19 +103,10 @@ __all__ = [
     "system",
     "system_begin",
     "system_end",
+    "token_length_normalized",
+    "unconditional_likelihood_normalized",
     "user",
     "user_begin",
     "user_end",
     "video",
-    "RuntimeEndpoint",
-    "greedy_token_selection",
-    "token_length_normalized",
-    "unconditional_likelihood_normalized",
-    "ServerArgs",
-    "Anthropic",
-    "LiteLLM",
-    "OpenAI",
-    "VertexAI",
-    "global_config",
-    "__version__",
 ]

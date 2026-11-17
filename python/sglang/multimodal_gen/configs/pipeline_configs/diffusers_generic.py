@@ -10,10 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass
@@ -50,10 +48,6 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
     vae_slicing: bool = False  # slice VAE decode for lower memory usage
     vae_sp: bool = False
 
-    # Attention backend for diffusers models (e.g., "flash", "_flash_3_hub", "sage", "xformers")
-    # See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
-    diffusers_attention_backend: str | None = None
-
     # Quantization config for pipeline-level quantization
     # See: https://huggingface.co/docs/diffusers/main/en/quantization/overview
     # Use PipelineQuantizationConfig for component-level control:
@@ -71,14 +65,51 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
         """
         pass
 
-    def adjust_size(self, width, height, image):
-        """
-        Pass through - diffusers handles size adjustments.
-        """
-        return width, height
 
-    def adjust_num_frames(self, num_frames):
-        """
-        Pass through - diffusers handles frame count.
-        """
-        return num_frames
+# Static subclasses for each non-default task type.
+# These exist so that _get_diffusers_model_info() can swap the task_type without
+# dynamically creating a class via make_dataclass -- dynamic classes break pickle
+# when multiprocessing uses the 'spawn' start method (see #21453).
+
+
+@dataclass
+class DiffusersT2VPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.T2V
+
+
+@dataclass
+class DiffusersI2VPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2V
+
+
+@dataclass
+class DiffusersTI2VPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.TI2V
+
+
+@dataclass
+class DiffusersI2IPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2I
+
+
+@dataclass
+class DiffusersTI2IPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.TI2I
+
+
+@dataclass
+class DiffusersI2MPipelineConfig(DiffusersGenericPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2M
+
+
+DIFFUSERS_TASK_TYPE_TO_CONFIG: dict[
+    ModelTaskType, type[DiffusersGenericPipelineConfig]
+] = {
+    ModelTaskType.T2I: DiffusersGenericPipelineConfig,
+    ModelTaskType.T2V: DiffusersT2VPipelineConfig,
+    ModelTaskType.I2V: DiffusersI2VPipelineConfig,
+    ModelTaskType.TI2V: DiffusersTI2VPipelineConfig,
+    ModelTaskType.I2I: DiffusersI2IPipelineConfig,
+    ModelTaskType.TI2I: DiffusersTI2IPipelineConfig,
+    ModelTaskType.I2M: DiffusersI2MPipelineConfig,
+}
